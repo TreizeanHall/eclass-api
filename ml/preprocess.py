@@ -165,7 +165,11 @@ def clean_html_email(text: str) -> str:
         return ""
 
     text = html.unescape(text)
-    soup = BeautifulSoup(text, "lxml")
+    try:
+        soup = BeautifulSoup(text, "lxml")
+    except Exception:
+        soup = BeautifulSoup(text, "html.parser")
+
 
     cleaned = soup.get_text("\n", strip=True)
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
@@ -222,22 +226,25 @@ def clean_html_email(text: str) -> str:
     return cleaned
 
 
+
 def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
     """
     Required inputs:
-      - df['subject'] (optional but recommended)
+      - df['subject'] (optional)
       - df['description'] (raw HTML body)
     Output:
       - adds df['clean_text'], df['modeltext']
       - drops empty modeltext rows
     """
-    df = df.copy()
 
-    # Normalize headers to lowercase
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    # Accept either...
+    if "description" not in df.columns and "body" in df.columns:
+        df["description"] = df["body"]
 
     if RAW_BODY_COL not in df.columns:
-        raise ValueError(f"Missing required column: {RAW_BODY_COL}")
+        raise ValueError(f"Missing required column: {RAW_BODY_COL} (or provide 'body')")
 
     if SUBJECT_COL not in df.columns:
         df[SUBJECT_COL] = ""
@@ -250,8 +257,8 @@ def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
         + df["clean_text"].fillna("").astype(str).str.strip()
     ).str.slice(0, 2000)
 
-    # Drop empty modeltext
     df["modeltext"] = df["modeltext"].fillna("").astype(str).str.strip()
     df = df[df["modeltext"].str.len() > 0].copy()
 
     return df
+

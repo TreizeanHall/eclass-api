@@ -1,14 +1,12 @@
-import re
-import json
-import hashlib
 from datetime import datetime
 from pathlib import Path
-from collections import Counter
+import json
+import re
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
 import joblib
-import matplotlib.pyplot as plt
 
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -159,7 +157,7 @@ def top_ngrams_per_label_chi2(
 
 
 # ----------------------------
-# MAIN TRAIN FUNCTION (API calls this)
+# MAIN TRAIN FUNCTION (API call)
 # ----------------------------
 def train_model(
     use_calibration: bool = True,
@@ -170,25 +168,53 @@ def train_model(
     API-safe training entrypoint:
       - pulls from Dataverse TDS via fetch_training_df()
       - expects columns: subject, body, label
+      - optionally includes: incidentid, ticketnumber
       - trains model
-      - saves artifacts under artifacts/<RUN_ID>/
+      - saves artifacts under artifacts/<RUN_ID>/ and artifacts/latest/
       - returns JSON-safe summary
     """
     if best_c_grid is None:
         best_c_grid = [3]
 
-    # 1) Fetch from SQL (no import-time execution elsewhere)
-    df_raw = fetch_training_df(...)
+    # 1) Fetch from SQL
+    df_raw = fetch_training_df()
+
+    # Normalize columns
+    df_raw.columns = [c.lower() for c in df_raw.columns]
+
+    required = {"subject", "body", "label"}
+    if not required.issubset(df_raw.columns):
+        raise RuntimeError(f"TDS fetch must return {required}. Got: {list(df_raw.columns)}")
+
+    trace_cols = [c for c in ["incidentid", "ticketnumber"] if c in df_raw.columns]
+
+    # Ensure strings for trace cols (Dataverse GUIDs can be special types)
+    for c in trace_cols:
+        df_raw[c] = df_raw[c].astype(str)
+
+    # 2) Preprocess (should preserve extra columns)
     df = preprocess_df(df_raw)
-    X = df["modeltext"]
-    y_raw = df["casetype"].fillna("Other").astype(str)   # or your label column
 
-    # 2) Build model text (TEMP placeholder)
-    # You said you’ll share preprocessing code after — for now:
-    df["modeltext"] = (df["subject"].fillna("").astype(str) + " " + df["body"].fillna("").astype(str)).str.strip()
+    # If preprocess_df drops columns, reattach trace cols from raw by index alignment
+    for c in trace_cols:
+        if c not in df.columns and c in df_raw.columns and len(df_raw) == len(df):
+            df[c] = df_raw[c].values
 
-    X = df["modeltext"].astype(str)
+    # Ensure modeltext exists (build if preprocess didn't create it)
+    if "modeltext" not in df.columns:
+        df["modeltext"] = (
+            df["subject"].fillna("").astype(str) + " " + df["body"].fillna("").astype(str)
+        ).str.strip()
+
+    # Clean labels
     y_raw = df["label"].fillna("Other").astype(str)
+    X = df["modeltext"].fillna("").astype(str)
+
+    # Drop empties after preprocessing (safety)
+    keep_mask = X.str.strip().ne("")
+    df = df.loc[keep_mask].copy()
+    X = X.loc[keep_mask]
+    y_raw = y_raw.loc[keep_mask]
 
     # 3) Run folder
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -199,21 +225,21 @@ def train_model(
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
 
-    # 5) Holdout split
-    row_ids = df.index.to_numpy()
-    X_train, X_test, y_train, y_test, id_train, id_test = train_test_split(
-        X, y, row_ids,
+    # 5) Holdout split (keep trace info)
+    X_train, X_test, y_train, y_test, df_train, df_test = train_test_split(
+        X, y, df,
         test_size=0.2,
         random_state=42,
         stratify=y
     )
 
-    # CV folds (for calibration)
+    # CV folds
     min_class = pd.Series(y_train).value_counts().min()
-    n_splits = max(3, min(5, int(min_class)))
+    n_splits = 3 if min_class >= 3 else 2
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-    # 6) Word + char TFIDF
+
+    # 6) TFIDF features
     word_tfidf = TfidfVectorizer(sublinear_tf=True, ngram_range=(1, 2), min_df=2, max_df=0.9)
     char_tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, sublinear_tf=True)
 
@@ -246,12 +272,11 @@ def train_model(
     gs.fit(X_train, y_train)
     best_c = gs.best_params_["clf__C"]
     best_cv = float(gs.best_score_)
-
     pipe_svc = gs.best_estimator_
 
     # 7) Optional calibration
     if use_calibration:
-        tuned_svc = LinearSVC(C=best_c, class_weight="balanced", random_state=42, max_iter=20000)
+        tuned_svc = LinearSVC(C=best_c, class_weight="balanced", random_state=42, max_iter=20000, dual=False)
         pipe_final = Pipeline([
             ("features", features),
             ("clf", CalibratedClassifierCV(tuned_svc, cv=skf, method="sigmoid")),
@@ -260,11 +285,20 @@ def train_model(
     else:
         pipe_final = pipe_svc
 
-    # 8) Chi2 n-grams (word only)
+    # 7.5) Chi2 n-grams diagnostics (word TF-IDF only)
     fitted_word = pipe_final.named_steps["features"].transformer_list[0][1]
-    top_ngrams_per_label_chi2(fitted_word, X_train, y_train, le, out_dir, top_n=20, save_plots=True)
+    top_ngrams_per_label_chi2(
+        tfidf_word=fitted_word,
+        X_text=pd.Series(X_train),
+        y_encoded=np.array(y_train),
+        le=le,
+        out_dir=out_dir,
+        top_n=20,
+        save_plots=True,
+    )
 
-    # 9) Holdout predict
+    
+    # 8) Holdout predict + reports
     X_test_s = pd.Series(X_test).reset_index(drop=True)
     y_pred = pipe_final.predict(X_test_s)
 
@@ -280,7 +314,6 @@ def train_model(
         output_dict=True
     )
 
-    # Confusion matrix
     cm = confusion_matrix(y_test, y_pred, labels=labels_present)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=target_names)
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -290,32 +323,44 @@ def train_model(
     plt.savefig(out_dir / "confusion_matrix_holdout.png", dpi=200)
     plt.close()
 
-    # Review suggestions (only when pred == Other)
+    # Decode labels for export
     true_labels = le.inverse_transform(y_test)
     pred_labels = le.inverse_transform(y_pred)
 
-    suggested = [post_predict_override(txt, pred) for txt, pred in zip(X_test_s.values, pred_labels)]
-    suggested_labels = [s for s, _ in suggested]
-    suggested_reasons = [r for _, r in suggested]
-
-    test_results_df = pd.DataFrame({
-        "row_id": id_test,
+    # 9) Holdout results export WITH incidentid/ticketnumber if present
+    df_test_export = df_test.reset_index(drop=True).copy()
+    results_df = pd.DataFrame({
         "text": X_test_s.values,
         "true_label": true_labels,
         "pred_label": pred_labels,
-        "review_suggested_label": suggested_labels,
-        "review_reason": suggested_reasons
     })
-    test_results_df.to_csv(out_dir / "holdout_test_results.csv", index=False)
 
-    # Save artifacts
+    # Attach trace cols
+    for c in trace_cols:
+        results_df[c] = df_test_export[c].astype(str).values
+
+    # Attach subject/body for easier review
+    if "subject" in df_test_export.columns:
+        results_df["subject"] = df_test_export["subject"].astype(str).values
+    if "body" in df_test_export.columns:
+        results_df["body"] = df_test_export["body"].astype(str).values
+
+    results_df.to_csv(out_dir / "holdout_test_results.csv", index=False)
+
+    # 10) Save artifacts
     joblib.dump(pipe_svc, out_dir / "linearsvc_bestC_uncalibrated.joblib")
     joblib.dump(pipe_final, out_dir / "inference_model.joblib")
-    pd.DataFrame({"label_id": range(len(le.classes_)), "label_name": le.classes_}).to_csv(out_dir / "label_map.csv", index=False)
-    latest_dir = Path("artifacts") / "latest"
+
+    pd.DataFrame({"label_id": range(len(le.classes_)), "label_name": le.classes_}).to_csv(
+        out_dir / "label_map.csv", index=False
+    )
+
+    latest_dir = Path(artifacts_root) / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(pipe_final, latest_dir / "inference_model.joblib")
-
+    pd.DataFrame({"label_id": range(len(le.classes_)), "label_name": le.classes_}).to_csv(
+        latest_dir / "label_map.csv", index=False
+    )
 
     params = {
         "run_id": run_id,
@@ -325,6 +370,7 @@ def train_model(
         "best_cv_macro_f1": best_cv,
         "calibrated": bool(use_calibration),
         "artifacts_dir": str(out_dir),
+        "trace_cols": trace_cols,
         "files": {
             "inference_model": "inference_model.joblib",
             "uncalibrated_model": "linearsvc_bestC_uncalibrated.joblib",
@@ -336,7 +382,6 @@ def train_model(
     with open(out_dir / "train_params.json", "w", encoding="utf-8") as f:
         json.dump(params, f, indent=2)
 
-    # Return API-safe summary
     return {
         "status": "trained",
         "run_id": run_id,
@@ -347,4 +392,5 @@ def train_model(
         "labels": list(le.classes_),
         "classification_report": report,
         "artifacts_dir": str(out_dir),
+        "trace_cols": trace_cols,
     }

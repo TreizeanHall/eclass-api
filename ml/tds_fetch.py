@@ -8,13 +8,14 @@ import msal
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 
 
-# --- Your SQL: 200 per label, older than 30 days, drop null/blank subject+description ---
 DEFAULT_TRAINING_SQL = r"""
 WITH base AS (
     SELECT
         e.subject,
         e.[description] AS body,
         i.caseTypeCodeName AS label,
+        i.incidentid,
+        i.ticketnumber,
         i.createdon AS incident_createdon
     FROM email e
     INNER JOIN incident i
@@ -47,9 +48,7 @@ WITH base AS (
         'Annual Review'
     )
     AND i.createdon < DATEADD(day, -30, GETDATE())
-    AND i.createdon <  GETDATE()
-
-    -- drop nulls/blanks
+    AND i.createdon < GETDATE()
     AND e.[description] IS NOT NULL
     AND e.subject IS NOT NULL
     AND LTRIM(RTRIM(e.[description])) <> ''
@@ -60,6 +59,8 @@ ranked AS (
         subject,
         body,
         label,
+        incidentid,
+        ticketnumber,
         incident_createdon,
         ROW_NUMBER() OVER (
             PARTITION BY label
@@ -70,7 +71,9 @@ ranked AS (
 SELECT
     subject,
     body,
-    label
+    label,
+    incidentid,
+    ticketnumber
 FROM ranked
 WHERE rn <= 200
 ORDER BY label, incident_createdon DESC;
@@ -111,15 +114,14 @@ def _token_to_odbc_bytes(access_token: str) -> bytes:
 def fetch_training_df() -> pd.DataFrame:
     """
     Connects to Dataverse TDS endpoint, executes the training SQL, and returns:
-      columns: subject, body, label
+    columns: subject, body, label, incidentid, ticketnumber
     """
-    # e.g. "yourorg.crm.dynamics.com,1433" (or ,5558)
+    # e.g. "brightway.crm.dynamics.com, 5558"
     server = os.getenv("DATAVERSE_TDS_SERVER")
     if not server:
         raise RuntimeError("DATAVERSE_TDS_SERVER is not set. Provide it via docker -e DATAVERSE_TDS_SERVER=...")
+    
     database = os.environ.get("DATAVERSE_TDS_DB", "dataverse")
-
-    # Allow override via env var, otherwise use the embedded query
     sql = os.environ.get("TRAINING_SQL_QUERY", DEFAULT_TRAINING_SQL)
 
     access_token = _acquire_access_token_for_sql()
@@ -137,14 +139,18 @@ def fetch_training_df() -> pd.DataFrame:
     with pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_bytes}) as conn:
         df = pd.read_sql(sql, conn)
 
-    # Ensure the DataFrame is exactly what your trainer expects
-    expected = {"subject", "body", "label"}
-    missing = expected - set(df.columns.str.lower())
-    # Some drivers preserve case; normalize:
+    #Normalize columns first
     df.columns = [c.lower() for c in df.columns]
 
-    if not expected.issubset(df.columns):
-        raise RuntimeError(f"SQL did not return required columns {expected}. Got: {list(df.columns)}")
+    required = {"subject", "body", "label"}
+    if not required.issubset(df.columns):
+        raise RuntimeError(f"SQL did not return required columns {required}. Got: {list(df.columns)}")
 
-    # Return with consistent names (lowercase)
-    return df[["subject", "body", "label"]]
+    keep = ["subject", "body", "label", "incidentid", "ticketnumber"]
+    missing = [c for c in keep if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"SQL did not return required columns: {missing}. Got: {list(df.columns)}")
+
+    return df[keep]
+
+
